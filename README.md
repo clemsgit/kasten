@@ -180,9 +180,9 @@ systemctl start rke2-server
 
 For HA clusters:
 
-* Stop other control-plane nodes
+* On other node : systemctl stop rke2-server
 * Remove `/var/lib/rancher/rke2/server/db`
-* Restart nodes
+* Restart nodes : systemctl start rke2-server
 
 ---
 
