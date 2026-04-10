@@ -1,0 +1,27 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: Policy
+metadata:
+  name: rke2-etcd-backup
+  namespace: kasten-io
+spec:
+  comment: "RKE2 etcd backup via Kanister blueprint"
+  frequency: "@daily"
+  retention:
+    daily: 7
+  selector:
+    matchExpressions:
+      - key: k10.kasten.io/appNamespace
+        operator: In
+        values:
+          - etcd-backup-rke2
+  actions:
+    - action: backup
+      backupParameters:
+        profile:
+          name: minio-location
+          namespace: kasten-io
+        filters:
+          includeResources:
+            - name: rke2-etcd-details
+              version: v1
+              resource: secrets
