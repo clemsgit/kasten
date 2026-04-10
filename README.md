@@ -60,7 +60,7 @@ Restore via Kasten UI
 
 * RKE2 cluster (multi-node or single control-plane)
 * Kasten K10 installed
-* A configured **Location Profile** (S3 or MinIO)
+* A configured **Location Profile** (S3-MinIO for exemple)
 * Access to control-plane nodes (privileged operations required)
 
 ---
@@ -92,11 +92,9 @@ metadata:
   name: rke2-etcd-details
   namespace: etcd-backup-rke2
 type: Opaque
-data:
-  snapshotDir: L3Zhci9saWIvcmFuY2hlci9ya2UyL3NlcnZlci9kYi9zbmFwc2hvdHM=
+stringData:
+  snapshotDir: "/var/lib/rancher/rke2/server/db/snapshots"
 ```
-
-(Base64 = `/var/lib/rancher/rke2/server/db/snapshots`)
 
 ---
 
