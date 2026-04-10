@@ -221,16 +221,6 @@ For HA clusters:
 
 ---
 
-## 📌 Notes
-
-This implementation is designed for:
-
-* air-gapped environments
-* secure infrastructures
-* controlled SRE workflows
-
----
-
 ## 📬 Review Request
 
 This solution is provided for validation regarding:
