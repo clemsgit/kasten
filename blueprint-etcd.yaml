@@ -1,0 +1,371 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: rke2-etcd-snapshot-only
+  namespace: kasten-io
+
+actions:
+  backup:
+    outputArtifacts:
+      rke2BackupInfo:
+        keyValue:
+          # backupLocation: "{{ .Phases.uploadBackup.Output.backupLocation }}"
+          nodeNameRunningSnapshot: "{{ .Phases.createSnapshot.Output.nodeName }}"
+          snapshotName: "{{ .Phases.createSnapshot.Output.snapshotName }}"
+        kopiaSnapshot: "{{ .Phases.uploadBackup.Output.kopiaOutput }}"
+    phases:
+      - func: KubeTask
+        name: createSnapshot
+        args:
+          image: ghcr.io/kanisterio/kanister-tools:0.118.0
+          namespace: "{{ .Object.metadata.namespace }}"
+          podOverride:
+            hostNetwork: true
+            hostPID: true
+            dnsPolicy: ClusterFirstWithHostNet
+            nodeSelector:
+              node-role.kubernetes.io/control-plane: "true"
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+            volumes:
+              - name: host-root
+                hostPath:
+                  path: /
+                  type: Directory
+            containers:
+              - name: container
+                securityContext:
+                  privileged: true
+                volumeMounts:
+                  - name: host-root
+                    mountPath: /host
+          command:
+            - bash
+            - -c
+            - |
+              chroot /host /bin/bash -c '
+                set -euo pipefail
+                umask 077
+
+                SNAPDIR="{{ index .Object.data "snapshotDir" | toString | b64dec }}"
+                mkdir -p "${SNAPDIR}"
+
+                if command -v rke2 >/dev/null 2>&1; then
+                  RKE2_BIN=$(command -v rke2)
+                elif [ -x /usr/local/bin/rke2 ]; then
+                  RKE2_BIN=/usr/local/bin/rke2
+                elif [ -x /var/lib/rancher/rke2/bin/rke2 ]; then
+                  RKE2_BIN=/var/lib/rancher/rke2/bin/rke2
+                elif [ -x /opt/rke2/bin/rke2 ]; then
+                  RKE2_BIN=/opt/rke2/bin/rke2
+                else
+                  echo "rke2 binary not found" >&2
+                  exit 1
+                fi
+
+                TS=$(date -u +%Y%m%dT%H%M%SZ)
+                NAME="kasten-${TS}"
+
+                ${RKE2_BIN} etcd-snapshot save \
+                  --name "${NAME}" \
+                  --etcd-snapshot-dir "${SNAPDIR}"
+
+                FILE=$(ls -1t "${SNAPDIR}/${NAME}"* | head -n1)
+                test -n "${FILE}"
+
+                printf "%s\n" "${NAME}" > /tmp/snapshotName
+                printf "%s\n" "${FILE}" > /tmp/snapshotPath
+                printf "%s\n" "$(hostname)" > /tmp/nodeName
+              '
+
+              kando output snapshotName "$(cat /host/tmp/snapshotName)"
+              kando output snapshotPath "$(cat /host/tmp/snapshotPath)"
+              kando output nodeName "$(cat /host/tmp/nodeName)"
+
+      - func: KubeTask
+        name: packageBackup
+        args:
+          image: ghcr.io/kanisterio/kanister-tools:0.118.0
+          namespace: "{{ .Object.metadata.namespace }}"
+          podOverride:
+            hostNetwork: true
+            hostPID: true
+            dnsPolicy: ClusterFirstWithHostNet
+            nodeSelector:
+              node-role.kubernetes.io/control-plane: "true"
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+            volumes:
+              - name: host-root
+                hostPath:
+                  path: /
+                  type: Directory
+            containers:
+              - name: container
+                securityContext:
+                  privileged: true
+                volumeMounts:
+                  - name: host-root
+                    mountPath: /host
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+
+              SNAPNAME="{{ .Phases.createSnapshot.Output.snapshotName }}"
+              SNAPPATH="{{ .Phases.createSnapshot.Output.snapshotPath }}"
+              NODE="{{ .Phases.createSnapshot.Output.nodeName }}"
+
+              export SNAPNAME
+              export SNAPPATH
+              export NODE
+
+              chroot /host /bin/bash -c '
+                set -euo pipefail
+                umask 077
+
+                TOKEN_PATH=/var/lib/rancher/rke2/server/token
+                ROOT=/var/lib/rancher/rke2/server/db/kasten
+                WORK="${ROOT}/${SNAPNAME}"
+                ARCHIVE_NAME="${SNAPNAME}-${NODE}.tar.gz"
+                ARCHIVE_PATH="${ROOT}/${ARCHIVE_NAME}"
+
+                mkdir -p "${WORK}"
+
+                cp "${SNAPPATH}" "${WORK}/snapshot.db"
+                cp "${TOKEN_PATH}" "${WORK}/token"
+                sha256sum "${WORK}/snapshot.db" > "${WORK}/snapshot.sha256"
+
+                if command -v rke2 >/dev/null 2>&1; then
+                  RKE2_VERSION="$(rke2 --version | head -n1)"
+                elif [ -x /usr/local/bin/rke2 ]; then
+                  RKE2_VERSION="$(/usr/local/bin/rke2 --version | head -n1)"
+                elif [ -x /var/lib/rancher/rke2/bin/rke2 ]; then
+                  RKE2_VERSION="$(/var/lib/rancher/rke2/bin/rke2 --version | head -n1)"
+                elif [ -x /opt/rke2/bin/rke2 ]; then
+                  RKE2_VERSION="$(/opt/rke2/bin/rke2 --version | head -n1)"
+                else
+                  RKE2_VERSION="unknown"
+                fi
+
+                printf "%s\n" \
+                  "SNAPSHOT_NAME=${SNAPNAME}" \
+                  "SNAPSHOT_SOURCE=${SNAPPATH}" \
+                  "NODE_NAME=${NODE}" \
+                  "CREATED_AT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                  "RKE2_VERSION=${RKE2_VERSION}" \
+                  > "${WORK}/metadata.env"
+
+                printf "%s\n" \
+                  "# RKE2 etcd restore procedure" \
+                  "" \
+                  "Procedure: https://docs.rke2.io/datastore/backup_restore?etcdsnap=Multiple+Servers" \
+                  "" \
+                  "This archive contains:" \
+                  "- snapshot.db" \
+                  "- snapshot.sha256" \
+                  "- token" \
+                  "- metadata.env" \
+                  "" \
+                  "Restore must be executed by an RKE2 administrator on one control-plane node." \
+                  "" \
+                  "1. Copy snapshot.db to:" \
+                  "   /var/lib/rancher/rke2/server/db/restore/snapshot.db" \
+                  "" \
+                  "2. Copy token to:" \
+                  "   /var/lib/rancher/rke2/server/token" \
+                  "" \
+                  "3. Stop RKE2:" \
+                  "   systemctl stop rke2-server" \
+                  "" \
+                  "4. Verify checksum:" \
+                  "   sha256sum -c snapshot.sha256" \
+                  "" \
+                  "5. Restore snapshot:" \
+                  "   rke2 server --cluster-reset --cluster-reset-restore-path /var/lib/rancher/rke2/server/db/restore/snapshot.db" \
+                  "" \
+                  "6. Start RKE2:" \
+                  "   systemctl start rke2-server" \
+                  "" \
+                  "7. HA only, on other control-plane nodes:" \
+                  "   systemctl stop rke2-server" \
+                  "   rm -rf /var/lib/rancher/rke2/server/db" \
+                  "   systemctl start rke2-server" \
+                  > "${WORK}/restore.md"
+
+                tar czf "${ARCHIVE_PATH}" -C "${ROOT}" "${SNAPNAME}"
+
+                printf "%s\n" "${ARCHIVE_NAME}" > /tmp/archiveName
+                printf "%s\n" "${ARCHIVE_PATH}" > /tmp/archivePath
+              '
+
+              kando output archiveName "$(cat /host/tmp/archiveName)"
+              kando output archivePath "$(cat /host/tmp/archivePath)"
+
+      - func: KubeTask
+        name: uploadBackup
+        args:
+          image: ghcr.io/kanisterio/kanister-tools:0.118.0
+          namespace: "{{ .Object.metadata.namespace }}"
+          podOverride:
+            hostNetwork: true
+            hostPID: true
+            dnsPolicy: ClusterFirstWithHostNet
+            nodeSelector:
+              node-role.kubernetes.io/control-plane: "true"
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+            volumes:
+              - name: host-root
+                hostPath:
+                  path: /
+                  type: Directory
+            containers:
+              - name: container
+                securityContext:
+                  privileged: true
+                volumeMounts:
+                  - name: host-root
+                    mountPath: /host
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+
+              ARCHIVE_NAME="{{ .Phases.packageBackup.Output.archiveName }}"
+              ARCHIVE_PATH="{{ .Phases.packageBackup.Output.archivePath }}"
+              SNAPNAME="{{ .Phases.createSnapshot.Output.snapshotName }}"
+              SNAPPATH="{{ .Phases.createSnapshot.Output.snapshotPath }}"
+
+              YEAR="$(date -u +%Y)"
+              MONTH="$(date -u +%m)"
+              BACKUP_LOCATION="rke2-etcd/{{ .Object.metadata.namespace }}/${YEAR}/${MONTH}/${SNAPNAME}"
+
+              echo "Uploading archive to object storage: ${BACKUP_LOCATION}"
+
+              cat "/host${ARCHIVE_PATH}" | \
+              kando location push \
+                --profile '{{ toJson .Profile }}' \
+                --path "${BACKUP_LOCATION}" \
+                --output-name kopiaOutput \
+                -
+
+              echo "Upload completed"
+
+              ARCHIVE="/host${ARCHIVE_PATH}"
+              WORKDIR="/host/var/lib/rancher/rke2/server/db/kasten/${SNAPNAME}"
+              SOURCE_SNAPSHOT="/host${SNAPPATH}"
+
+              echo "Deleting local archive: ${ARCHIVE}"
+              rm -f "${ARCHIVE}"
+
+              echo "Deleting local workdir: ${WORKDIR}"
+              rm -rf "${WORKDIR}"
+
+              echo "Deleting source snapshot: ${SOURCE_SNAPSHOT}"
+              rm -f "${SOURCE_SNAPSHOT}"
+
+              echo "Cleanup completed"
+
+              kando output backupLocation "${BACKUP_LOCATION}"
+
+  restore:
+    inputArtifactNames:
+      - rke2BackupInfo
+    phases:
+      - func: KubeTask
+        name: restoreFiles
+        args:
+          image: ghcr.io/kanisterio/kanister-tools:0.118.0
+          namespace: "{{ .Object.metadata.namespace }}"
+          podOverride:
+            hostNetwork: true
+            hostPID: true
+            dnsPolicy: ClusterFirstWithHostNet
+            nodeSelector:
+              node-role.kubernetes.io/control-plane: "true"
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+            volumes:
+              - name: host-root
+                hostPath:
+                  path: /
+                  type: Directory
+            containers:
+              - name: container
+                securityContext:
+                  privileged: true
+                volumeMounts:
+                  - name: host-root
+                    mountPath: /host
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+
+              BACKUP_LOCATION='{{ .ArtifactsIn.rke2BackupInfo.KeyValue.backupLocation }}'
+              SNAPNAME='{{ .ArtifactsIn.rke2BackupInfo.KeyValue.snapshotName }}'
+              NODE='{{ .ArtifactsIn.rke2BackupInfo.KeyValue.nodeName }}'
+              ARCHIVE_NAME="${SNAPNAME}-${NODE}.tar.gz"
+              KOPIA_SNAP='{{ .ArtifactsIn.rke2BackupInfo.KopiaSnapshot }}'
+
+              RESTORE_ROOT="/host/var/lib/rancher/rke2/server/db/restore"
+              ARCHIVE_PATH="${RESTORE_ROOT}/${ARCHIVE_NAME}"
+
+              mkdir -p "${RESTORE_ROOT}"
+
+              echo "Restore staging path: ${RESTORE_ROOT}"
+              echo "Restore will run on node: $(chroot /host hostname)"
+              echo "Archive path: ${ARCHIVE_PATH}"
+              echo "Downloading backup from ${BACKUP_LOCATION}"
+
+              kando location pull \
+                --profile '{{ toJson .Profile }}' \
+                --path "${BACKUP_LOCATION}" \
+                --kopia-snapshot "${KOPIA_SNAP}" \
+                - > "${ARCHIVE_PATH}"
+
+              echo "Extracting archive with host tar"
+
+              chroot /host /bin/bash -c "
+                set -euo pipefail
+                mkdir -p /var/lib/rancher/rke2/server/db/restore
+                tar xzf /var/lib/rancher/rke2/server/db/restore/${ARCHIVE_NAME} -C /var/lib/rancher/rke2/server/db/restore
+              "
+              echo "Restore files available in ${RESTORE_ROOT}"
+              ls -lah "${RESTORE_ROOT}"
+              echo "Restore staging complete"
+
+  delete:
+    inputArtifactNames:
+      - rke2BackupInfo
+    phases:
+      - func: KubeTask
+        name: deleteBackup
+        args:
+          image: ghcr.io/kanisterio/kanister-tools:0.118.0
+          namespace: "{{ .Object.metadata.namespace }}"
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+
+              BACKUP_LOCATION='{{ .ArtifactsIn.rke2BackupInfo.KeyValue.backupLocation }}'
+              KOPIA_SNAP='{{ .ArtifactsIn.rke2BackupInfo.KopiaSnapshot }}'
+
+              kando location delete \
+                --profile '{{ toJson .Profile }}' \
+                --path "${BACKUP_LOCATION}" \
+                --kopia-snapshot "${KOPIA_SNAP}"
